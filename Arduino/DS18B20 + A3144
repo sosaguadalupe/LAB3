@@ -1,0 +1,58 @@
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+const uint8_t       PIN_DS   = 22;      
+const uint8_t       PIN_HALL = 18;     
+const unsigned long TS_T     = 1000;    
+const unsigned long TS_R     = 5000;  
+const uint8_t       PPR      = 1;       
+const float         T_MIN    = -55.0;   
+const float         T_MAX    = 125.0;
+const float         RATE_MAX = 2.5;     
+
+OneWire ow(PIN_DS);
+DallasTemperature ds(&ow);
+volatile unsigned long pulsos = 0;
+unsigned long tT, tR;
+float Tprev = NAN;
+void isrHall() { pulsos++; }
+void setup() {
+  Serial.begin(115200);
+  ds.begin();
+  if (ds.getDeviceCount() == 0) Serial.println(F("# DS18B20 no detectado"));
+  ds.setResolution(12);
+  ds.setWaitForConversion(false);       
+  ds.requestTemperatures();
+  pinMode(PIN_HALL, INPUT_PULLUP);       
+  attachInterrupt(digitalPinToInterrupt(PIN_HALL), isrHall, FALLING);
+
+  Serial.println(F("# T,ms,T_C,rango_ok,salto"));
+  Serial.println(F("# R,ms,N,RPM"));
+  tT = tR = millis();
+}
+void loop() {
+  unsigned long ahora = millis();
+  if (ahora - tT >= TS_T) {
+    tT += TS_T;
+    float T = ds.getTempCByIndex(0);      
+    ds.requestTemperatures();
+    bool rango = (T != DEVICE_DISCONNECTED_C) && (T != 85.0f) && (T >= T_MIN) && (T <= T_MAX);
+    bool salto = rango && !isnan(Tprev) && fabs(T - Tprev) > RATE_MAX * TS_T / 1000.0;
+    if (rango) Tprev = T;
+    
+    Serial.print(F("T,"));  Serial.print(ahora); Serial.print(',');
+    Serial.print(T, 4);     Serial.print(',');
+    Serial.print(rango);    Serial.print(',');
+    Serial.println(salto);
+  }
+  if (ahora - tR >= TS_R) {
+    unsigned long N;
+    noInterrupts(); N = pulsos; pulsos = 0; interrupts();
+    float rpm = 60.0 * N / (PPR * (ahora - tR) / 1000.0);
+    tR = ahora;
+
+    Serial.print(F("R,"));  Serial.print(ahora); Serial.print(',');
+    Serial.print(N);        Serial.print(',');
+    Serial.println(rpm, 1);
+  }
+}
