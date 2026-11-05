@@ -1,0 +1,12 @@
+// ESP8266 maestro I2C
+#include <Wire.h>
+
+const uint8_t MEGA_ADDR = 0x08;
+unsigned long tLectura = 0;
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(4, 5);          // SDA=GPIO4 (D2), SCL=GPIO5 (D1)
+  Wire.setClock(100000);
+  Serial.println("Gateway listo. Comando: s <sensor 0|1> <ms>");
+}
