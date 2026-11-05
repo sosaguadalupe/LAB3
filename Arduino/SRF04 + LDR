@@ -41,3 +41,71 @@ void setup() {
   Wire.onRequest(alPedir);
 }
 
+void loop() {
+  unsigned long ahora = millis();
+
+  // --- LDR ---
+  if (ahora - tLdr >= intervalo[0]) {
+    tLdr = ahora;
+    bufLdr[idxLdr] = analogRead(PIN_LDR);
+    idxLdr = (idxLdr + 1) % N_LDR;
+    if (idxLdr == 0) bufLleno = true;
+    uint8_t n = bufLleno ? N_LDR : idxLdr;
+    if (n == 0) n = 1;
+    uint32_t suma = 0;
+    for (uint8_t i = 0; i < n; i++) suma += bufLdr[i];
+    ldrProm = suma / n;
+  }
+
+  // SRF04: dispara cada intervalo[1] 
+  switch (estSrf) {
+    case SRF_IDLE:
+      if (ahora - tSrf >= intervalo[1]) {
+        tSrf = ahora;
+        digitalWrite(PIN_TRIG, HIGH);
+        tTrig = micros();
+        estSrf = SRF_TRIG;
+      }
+      break;
+    case SRF_TRIG:
+      if (micros() - tTrig >= 10) {
+        digitalWrite(PIN_TRIG, LOW);
+        tTrig = micros();
+        estSrf = SRF_ESPERA_ECHO;
+      }
+      break;
+    case SRF_ESPERA_ECHO:
+      if (digitalRead(PIN_ECHO)) {
+        tEchoIni = micros();
+        estSrf = SRF_MIDE_ECHO;
+      } else if (micros() - tTrig > 30000UL) {
+        distMm = 0; estSrf = SRF_IDLE;      // sin eco
+      }
+      break;
+    case SRF_MIDE_ECHO:
+      if (!digitalRead(PIN_ECHO)) {
+        unsigned long dt = micros() - tEchoIni;
+        distMm = (uint16_t)(dt * 0.1715f);  // v=343 m/s, ida y vuelta
+        estSrf = SRF_IDLE;
+      } else if (micros() - tEchoIni > 30000UL) {
+        distMm = 0; estSrf = SRF_IDLE;
+      }
+      break;
+  }
+}
+
+// ESP - Mega: [cmd=0x01][sensor][lo][hi]  (fija intervalo en ms)
+void alRecibir(int n) {
+  if (n < 4) { while (Wire.available()) Wire.read(); return; }
+  uint8_t cmd = Wire.read();
+  uint8_t s   = Wire.read();
+  uint16_t v  = Wire.read();
+  v |= (uint16_t)Wire.read() << 8;
+  if (cmd == 0x01 && s < 2 && v >= 50) intervalo[s] = v;
+}
+
+// Mega - ESP: 8 bytes = ldr, distMm, intLdr, intSrf (uint16 little-endian)
+void alPedir() {
+  uint16_t d[4] = {ldrProm, distMm, intervalo[0], intervalo[1]};
+  Wire.write((uint8_t*)d, 8);
+}
