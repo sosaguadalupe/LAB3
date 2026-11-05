@@ -25,3 +25,19 @@ unsigned long tLdr = 0, tSrf = 0;
 enum EstadoSrf { SRF_IDLE, SRF_TRIG, SRF_ESPERA_ECHO, SRF_MIDE_ECHO };
 EstadoSrf estSrf = SRF_IDLE;
 unsigned long tTrig = 0, tEchoIni = 0;
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+  digitalWrite(PIN_TRIG, LOW);
+
+  Wire.begin(I2C_ADDR);
+  // Wire activa pull-ups internos a 5 V: se desactivan porque el ESP8266 es de 3.3 V.
+  // Usar pull-ups externos de 4.7k a 3.3V.
+  digitalWrite(SDA, LOW);
+  digitalWrite(SCL, LOW);
+  Wire.onReceive(alRecibir);
+  Wire.onRequest(alPedir);
+}
+
