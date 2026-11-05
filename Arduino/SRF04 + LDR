@@ -4,7 +4,7 @@
 const uint8_t I2C_ADDR = 0x08;
 const uint8_t PIN_LDR  = A0;
 const uint8_t PIN_TRIG = 22;
-const uint8_t PIN_ECHO = 23;
+const uint8_t PIN_ECHO = 24;
 
 // Intervalos configurables (ms): [0]=LDR, [1]=SRF04
 volatile uint16_t intervalo[2] = {1000, 500};
