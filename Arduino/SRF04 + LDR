@@ -1,0 +1,27 @@
+// Arduino MEGA esclavo 
+#include <Wire.h>
+
+const uint8_t I2C_ADDR = 0x08;
+const uint8_t PIN_LDR  = A0;
+const uint8_t PIN_TRIG = 22;
+const uint8_t PIN_ECHO = 23;
+
+// Intervalos configurables (ms): [0]=LDR, [1]=SRF04
+volatile uint16_t intervalo[2] = {1000, 500};
+
+// Promedio móvil del LDR (filtro en el borde)
+const uint8_t N_LDR = 8;
+uint16_t bufLdr[N_LDR];
+uint8_t  idxLdr = 0;
+bool     bufLleno = false;
+
+// Valores a publicar
+volatile uint16_t ldrProm = 0;   // cuentas ADC (0-1023)
+volatile uint16_t distMm  = 0;   // mm (0 = sin eco válido)
+
+unsigned long tLdr = 0, tSrf = 0;
+
+// Máquina de estados del SRF04 (no bloqueante)
+enum EstadoSrf { SRF_IDLE, SRF_TRIG, SRF_ESPERA_ECHO, SRF_MIDE_ECHO };
+EstadoSrf estSrf = SRF_IDLE;
+unsigned long tTrig = 0, tEchoIni = 0;
