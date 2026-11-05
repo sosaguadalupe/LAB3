@@ -10,3 +10,39 @@ void setup() {
   Wire.setClock(100000);
   Serial.println("Gateway listo. Comando: s <sensor 0|1> <ms>");
 }
+
+void enviarIntervalo(uint8_t sensor, uint16_t ms) {
+  Wire.beginTransmission(MEGA_ADDR);
+  Wire.write(0x01);
+  Wire.write(sensor);
+  Wire.write(ms & 0xFF);
+  Wire.write(ms >> 8);
+  uint8_t err = Wire.endTransmission();
+  Serial.printf("Config sensor %u -> %u ms (I2C err=%u)\n", sensor, ms, err);
+}
+
+void loop() {
+  if (millis() - tLectura >= 2000) {
+    tLectura = millis();
+    if (Wire.requestFrom(MEGA_ADDR, (uint8_t)8) == 8) {
+      uint16_t d[4];
+      uint8_t *p = (uint8_t*)d;
+      for (uint8_t i = 0; i < 8; i++) p[i] = Wire.read();
+      float vLdr = d[0] * 3.3f / 1023.0f;   // solo referencia; el Mega mide con ref 5 V
+      Serial.printf("LDR=%u cuentas | dist=%u mm | int LDR=%u ms | int SRF=%u ms\n",
+                    d[0], d[1], d[2], d[3]);
+      (void)vLdr;
+    } else {
+      Serial.println("Sin respuesta del Mega (revisar cableado/pull-ups)");
+    }
+  }
+
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == 's') {
+      int sensor = Serial.parseInt();
+      int ms = Serial.parseInt();
+      if (sensor >= 0 && sensor <= 1 && ms >= 50) enviarIntervalo(sensor, ms);
+    }
+  }
+}
