@@ -1,7 +1,7 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
-const uint8_t       PIN_DS   = 22;      
+const uint8_t       PIN_DS   = 26;      
 const uint8_t       PIN_HALL = 18;     
 const unsigned long TS_T     = 1000;    
 const unsigned long TS_R     = 5000;  
