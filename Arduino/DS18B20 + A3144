@@ -1,37 +1,41 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
-
+// --- Definición de pines y constantes ---
 const uint8_t       PIN_DS   = 26;      
 const uint8_t       PIN_HALL = 18;     
-const unsigned long TS_T     = 1000;    
-const unsigned long TS_R     = 5000;  
-const uint8_t       PPR      = 1;       
+const unsigned long TS_T     = 1000;  // Período de muestreo de temperatura
+const unsigned long TS_R     = 5000;  // Período de muestreo de RPM
+const uint8_t       PPR      = 1;  // Pulsos por revolución       
 const float         T_MIN    = -55.0;   
 const float         T_MAX    = 125.0;
-const float         RATE_MAX = 2.5;     
-
+const float         RATE_MAX = 2.5;  // Tasa máxima de cambio de temperatura permitida
+// --- Instancias de objetos y variables globales ---
 OneWire ow(PIN_DS);
 DallasTemperature ds(&ow);
 volatile unsigned long pulsos = 0;
 unsigned long tT, tR;
 float Tprev = NAN;
+// --- Rutina de Servicio de Interrupción (ISR) ---
 void isrHall() { pulsos++; }
 void setup() {
   Serial.begin(115200);
+  // Configuración del sensor de temperatura
   ds.begin();
   if (ds.getDeviceCount() == 0) Serial.println(F("# DS18B20 no detectado"));
   ds.setResolution(12);
   ds.setWaitForConversion(false);       
   ds.requestTemperatures();
-  pinMode(PIN_HALL, INPUT_PULLUP);       
+  // Configuración del sensor Hall
+  pinMode(PIN_HALL, INPUT_PULLUP);  // Pull-up interno para evitar falsos disparos por ruido       
   attachInterrupt(digitalPinToInterrupt(PIN_HALL), isrHall, FALLING);
-
+  // Cabeceras de las tramas CSV para el monitor/logger
   Serial.println(F("# T,ms,T_C,rango_ok,salto"));
   Serial.println(F("# R,ms,N,RPM"));
-  tT = tR = millis();
+  tT = tR = millis();  // Inicialización de los temporizadores
 }
 void loop() {
   unsigned long ahora = millis();
+  // --- Lectura asíncrona de temperatura ---
   if (ahora - tT >= TS_T) {
     tT += TS_T;
     float T = ds.getTempCByIndex(0);      
@@ -39,18 +43,19 @@ void loop() {
     bool rango = (T != DEVICE_DISCONNECTED_C) && (T != 85.0f) && (T >= T_MIN) && (T <= T_MAX);
     bool salto = rango && !isnan(Tprev) && fabs(T - Tprev) > RATE_MAX * TS_T / 1000.0;
     if (rango) Tprev = T;
-    
+    // Transmisión de telemetría (CSV)
     Serial.print(F("T,"));  Serial.print(ahora); Serial.print(',');
     Serial.print(T, 4);     Serial.print(',');
     Serial.print(rango);    Serial.print(',');
     Serial.println(salto);
   }
+  // --- Cálculo de RPM ---
   if (ahora - tR >= TS_R) {
     unsigned long N;
     noInterrupts(); N = pulsos; pulsos = 0; interrupts();
     float rpm = 60.0 * N / (PPR * (ahora - tR) / 1000.0);
     tR = ahora;
-
+    // Transmisión de telemetría (CSV)
     Serial.print(F("R,"));  Serial.print(ahora); Serial.print(',');
     Serial.print(N);        Serial.print(',');
     Serial.println(rpm, 1);
