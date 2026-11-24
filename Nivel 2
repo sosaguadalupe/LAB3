@@ -1,0 +1,235 @@
+import json
+import logging
+import os
+import sqlite3
+import threading
+import time
+from datetime import datetime, timezone
+
+import paho.mqtt.client as mqtt
+import requests
+
+NODO = os.getenv("NODO", "nodo1")
+MQTT_HOST = os.getenv("MQTT_HOST", "localhost")
+MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+CLOUD_URL = os.getenv("CLOUD_URL", "https://utecnologica.org/estudiantes/imel/g04/api").rstrip("/")
+API_KEY = os.getenv("API_KEY", "cambiar")
+DB_PATH = os.getenv("DB_PATH", "nivel2.db")
+UPLOAD_S = int(os.getenv("UPLOAD_S", "600"))
+CONFIG_POLL_S = int(os.getenv("CONFIG_POLL_S", "30"))
+
+RETRY_S = 15          # reenvio de un comando sin ack
+MAX_INTENTOS = 8
+BATCH = 2000
+IDX = {"ldr": 0, "dist": 1, "temp": 2, "rpm": 3}
+HDR = {"X-API-Key": API_KEY}
+URL_INGESTA = os.getenv("URL_INGESTA", f"{CLOUD_URL}/ingesta.php")
+URL_PENDIENTE = os.getenv("URL_PENDIENTE", f"{CLOUD_URL}/config_pendiente.php")
+URL_ACK = os.getenv("URL_ACK", f"{CLOUD_URL}/config_ack.php")
+
+T_TEL = f"imec/{NODO}/telemetria/#"
+T_ACK = f"imec/{NODO}/config/ack"
+T_EST = f"imec/{NODO}/estado"
+T_SET = f"imec/{NODO}/config/set"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("nivel2")
+
+# ---------------- base de datos local ----------------
+DB = sqlite3.connect(DB_PATH, check_same_thread=False)
+DB.row_factory = sqlite3.Row
+LOCK = threading.Lock()
+with LOCK:
+    DB.executescript("""
+    PRAGMA journal_mode=WAL;
+    PRAGMA synchronous=NORMAL;
+    CREATE TABLE IF NOT EXISTS telemetria(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL, sensor TEXT NOT NULL, valor REAL, ok INTEGER NOT NULL,
+        intervalo_ms INTEGER, seq INTEGER, t_ms INTEGER,
+        enviado INTEGER NOT NULL DEFAULT 0);
+    CREATE INDEX IF NOT EXISTS ix_tel_env ON telemetria(enviado, id);
+    CREATE TABLE IF NOT EXISTS comandos(
+        cmd_id TEXT PRIMARY KEY, sensor TEXT NOT NULL, intervalo_ms INTEGER NOT NULL,
+        recibido_ts TEXT NOT NULL,
+        estado TEXT NOT NULL,      -- pendiente|enviado|aplicado|rechazado|sin_respuesta
+        intentos INTEGER NOT NULL DEFAULT 0, ultimo_envio REAL,
+        ack_ts TEXT, motivo TEXT, ack_nube INTEGER NOT NULL DEFAULT 0);
+    """)
+    DB.commit()
+
+
+def ejecutar(sql, args=()):
+    with LOCK:
+        cur = DB.execute(sql, args)
+        DB.commit()
+        return cur
+
+
+def consultar(sql, args=()):
+    with LOCK:
+        return DB.execute(sql, args).fetchall()
+
+
+def ahora_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+# ---------------- MQTT ----------------
+cliente = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"nivel2-{NODO}")
+
+
+def on_connect(c, userdata, flags, reason_code, properties):
+    log.info("MQTT conectado (%s)", reason_code)
+    c.subscribe([(T_TEL, 0), (T_ACK, 1), (T_EST, 1)])
+
+
+def on_message(c, userdata, msg):
+    try:
+        texto = msg.payload.decode()
+        if msg.topic == T_EST:
+            log.info("ESP8266: %s", texto)
+        elif msg.topic == T_ACK:
+            guardar_ack(json.loads(texto))
+        elif msg.topic.startswith(f"imec/{NODO}/telemetria/"):
+            guardar_muestra(msg.topic.rsplit("/", 1)[-1], json.loads(texto))
+    except (ValueError, UnicodeDecodeError) as e:
+        log.warning("mensaje invalido en %s: %s", msg.topic, e)
+
+
+def guardar_muestra(sensor, p):
+    if sensor not in IDX:
+        return
+    ejecutar(
+        "INSERT INTO telemetria(ts,sensor,valor,ok,intervalo_ms,seq,t_ms) VALUES(?,?,?,?,?,?,?)",
+        (ahora_iso(), sensor, p.get("valor"), int(p.get("ok", 1)),
+         p.get("intervalo_ms"), p.get("seq"), p.get("t_ms")))
+
+
+def guardar_ack(p):
+    cmd_id = p.get("cmd_id")
+    if not cmd_id:
+        return
+    estado = "aplicado" if p.get("aplicado") else "rechazado"
+    cur = ejecutar(
+        "UPDATE comandos SET estado=?, ack_ts=?, motivo=?, ack_nube=0 "
+        "WHERE cmd_id=? AND estado IN ('pendiente','enviado')",
+        (estado, ahora_iso(), p.get("motivo"), cmd_id))
+    if cur.rowcount:
+        log.info("ACK %s: %s (%s)", cmd_id, estado, p.get("motivo"))
+
+
+def enviar_comandos():
+    """Publica al ESP8266 los comandos pendientes o sin ack (reintento cada RETRY_S)."""
+    ahora = time.time()
+    filas = consultar("SELECT * FROM comandos WHERE estado IN ('pendiente','enviado')")
+    for f in filas:
+        if f["ultimo_envio"] is not None and ahora - f["ultimo_envio"] < RETRY_S:
+            continue
+        if f["intentos"] >= MAX_INTENTOS:
+            ejecutar("UPDATE comandos SET estado='sin_respuesta', ack_ts=?, motivo='esp_sin_respuesta', "
+                     "ack_nube=0 WHERE cmd_id=?", (ahora_iso(), f["cmd_id"]))
+            log.error("comando %s sin respuesta del ESP8266", f["cmd_id"])
+            continue
+        if not cliente.is_connected():
+            return
+        carga = f"{f['cmd_id']},{IDX[f['sensor']]},{f['intervalo_ms']}"
+        info = cliente.publish(T_SET, carga, qos=1)
+        if info.rc == mqtt.MQTT_ERR_SUCCESS:
+            ejecutar("UPDATE comandos SET estado='enviado', intentos=intentos+1, ultimo_envio=? "
+                     "WHERE cmd_id=?", (ahora, f["cmd_id"]))
+            log.info("comando %s -> ESP8266: %s", f["cmd_id"], carga)
+
+
+# ---------------- nube ----------------
+def consultar_config():
+    try:
+        r = requests.get(URL_PENDIENTE, params={"nodo": NODO},
+                         headers=HDR, timeout=10)
+        r.raise_for_status()
+        comandos = r.json().get("comandos", [])
+    except (requests.RequestException, ValueError) as e:
+        log.warning("polling de configuracion fallo: %s", e)
+        return
+    for c in comandos:
+        cmd_id, sensor, ms = c.get("cmd_id"), c.get("sensor"), c.get("intervalo_ms")
+        if not cmd_id or consultar("SELECT 1 FROM comandos WHERE cmd_id=?", (cmd_id,)):
+            continue
+        valido = sensor in IDX and isinstance(ms, int) and 0 < ms <= 65535
+        ejecutar("INSERT INTO comandos(cmd_id,sensor,intervalo_ms,recibido_ts,estado,motivo) "
+                 "VALUES(?,?,?,?,?,?)",
+                 (cmd_id, str(sensor), ms if isinstance(ms, int) else 0, ahora_iso(),
+                  "pendiente" if valido else "rechazado", None if valido else "comando_invalido"))
+        log.info("nuevo comando de la nube: %s %s=%s ms", cmd_id, sensor, ms)
+
+
+def enviar_acks_a_la_nube():
+    filas = consultar("SELECT * FROM comandos WHERE ack_nube=0 "
+                      "AND estado IN ('aplicado','rechazado','sin_respuesta')")
+    for f in filas:
+        cuerpo = {"nodo": NODO, "cmd_id": f["cmd_id"], "aplicado": f["estado"] == "aplicado",
+                  "motivo": f["motivo"], "ts": f["ack_ts"] or ahora_iso()}
+        try:
+            r = requests.post(URL_ACK, json=cuerpo, headers=HDR, timeout=10)
+            r.raise_for_status()
+        except requests.RequestException as e:
+            log.warning("ack a la nube fallo: %s", e)
+            return
+        ejecutar("UPDATE comandos SET ack_nube=1 WHERE cmd_id=?", (f["cmd_id"],))
+        log.info("ack de %s confirmado a la nube", f["cmd_id"])
+
+
+def subir_telemetria():
+    while True:
+        filas = consultar("SELECT * FROM telemetria WHERE enviado=0 ORDER BY id LIMIT ?", (BATCH,))
+        if not filas:
+            return
+        cuerpo = {"nodo": NODO, "muestras": [
+            {"uid": f"{NODO}-{f['id']}", "ts": f["ts"], "sensor": f["sensor"], "valor": f["valor"],
+             "ok": f["ok"], "intervalo_ms": f["intervalo_ms"], "seq": f["seq"]} for f in filas]}
+        try:
+            r = requests.post(URL_INGESTA, json=cuerpo, headers=HDR, timeout=30)
+            r.raise_for_status()
+        except requests.RequestException as e:
+            log.warning("subida a la nube fallo (se reintenta en el proximo ciclo): %s", e)
+            return
+        # los ids no enviados <= max(id) son exactamente los de este lote
+        ejecutar("UPDATE telemetria SET enviado=1 WHERE id BETWEEN ? AND ?",
+                 (filas[0]["id"], filas[-1]["id"]))
+        log.info("subidas %d muestras a la nube", len(filas))
+        if len(filas) < BATCH:
+            return
+
+
+# ---------------- bucle principal ----------------
+def main():
+    cliente.on_connect = on_connect
+    cliente.on_message = on_message
+    cliente.reconnect_delay_set(1, 30)
+    cliente.connect_async(MQTT_HOST, MQTT_PORT, keepalive=60)
+    cliente.loop_start()
+
+    t_cfg = 0.0
+    t_up = time.time()          # primera subida a los UPLOAD_S
+    try:
+        while True:
+            ahora = time.time()
+            if ahora - t_cfg >= CONFIG_POLL_S:
+                t_cfg = ahora
+                consultar_config()
+            enviar_comandos()
+            enviar_acks_a_la_nube()
+            if ahora - t_up >= UPLOAD_S:
+                t_up = ahora
+                subir_telemetria()
+            time.sleep(1)
+    except KeyboardInterrupt:
+        log.info("finalizando")
+    finally:
+        cliente.loop_stop()
+        cliente.disconnect()
+        DB.close()
+
+
+if __name__ == "__main__":
+    main()
