@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IMEC - Grupo 04 - Instrumentación IoT</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 1200px; margin: 0 auto; padding: 12px; color: #222; }
+  h1 { font-size: 22px; margin: 4px 0; }
+  h2 { font-size: 17px; margin: 18px 0 6px; }
+  .sub { color: #555; font-size: 13px; margin: 0 0 10px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+  .card { position: relative; height: 300px; border: 1px solid #ddd; border-radius: 6px; padding: 6px; }
+  .fila { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-end; }
+  label { font-size: 13px; display: block; }
+  input { padding: 4px; }
+  input[type=number] { width: 120px; }
+  button { padding: 6px 14px; cursor: pointer; }
+  #msg { margin: 8px 0; font-weight: bold; }
+  table { border-collapse: collapse; font-size: 12px; }
+  th, td { border-bottom: 1px solid #ddd; padding: 3px 10px; text-align: left; }
+  .nota { color: #666; font-size: 12px; }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+</head>
+<body>
+<h1>Sistema de Instrumentación Multivariable IoT/IIoT</h1>
+<p class="sub">UTEC · Ingeniería en Mecatrónica · Instrumentación y Medidas Eléctricas · Grupo 04 — Victoria Etcheverry, Sofía Modernell, Guadalupe Sosa.
+Arquitectura de tres niveles (Arduino Mega + ESP8266 · PC local con Mosquitto · servidor en la nube) con reconfiguración remota bidireccional.</p>
+
+<div class="fila">
+  <div><label>Desde</label><input type="date" id="ini"></div>
+  <div><label>Hasta</label><input type="date" id="fin"></div>
+  <button id="btnConsultar">Consultar</button>
+</div>
+<p class="nota">La telemetría llega con hasta 10 min de retraso (lotes del Nivel 2). La banda sombreada es la incertidumbre expandida U (k = 2).</p>
+
+<div class="grid">
+  <div class="card"><canvas id="c-ldr"></canvas></div>
+  <div class="card"><canvas id="c-dist"></canvas></div>
+  <div class="card"><canvas id="c-temp"></canvas></div>
+  <div class="card"><canvas id="c-rpm"></canvas></div>
+</div>
+
+<h2>Configuración remota (intervalo de muestreo, ms)</h2>
+<div class="fila" id="panel"></div>
+<div class="fila" style="margin-top:10px">
+  <div><label>Clave del panel</label><input type="password" id="clave" autocomplete="off"></div>
+  <button id="btnAplicar">Aplicar</button>
+</div>
+<div id="msg"></div>
+<div id="ult"></div>
+<h2>Comandos</h2>
+<div style="overflow-x:auto"><table id="tabla"></table></div>
+
+<script>
+const API = 'api/';
+const SENS = [
+  { k: 'ldr',  t: 'Luminosidad: R_LDR (kΩ)',   min: 50 },
+  { k: 'dist', t: 'Distancia SRF04 (mm)',       min: 60 },
+  { k: 'temp', t: 'Temperatura DS18B20 (°C)',   min: 750 },
+  { k: 'rpm',  t: 'Velocidad A3144 (RPM)',      min: 500 },
+];
+const charts = {};
+const $ = id => document.getElementById(id);
+const z = n => String(n).padStart(2, '0');
+const dStr = d => d.getFullYear() + '-' + z(d.getMonth() + 1) + '-' + z(d.getDate());
+const fmt = ms => ms == null ? '—' : new Date(Number(ms)).toLocaleString('es-UY',
+  { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+
+// ---- panel y gráficos ----
+SENS.forEach(s => {
+  const d = document.createElement('div');
+  d.innerHTML = `<label>${s.k} (mín ${s.min})</label><input type="number" id="iv-${s.k}" min="${s.min}" max="65535" step="1" placeholder="sin cambio">`;
+  $('panel').appendChild(d);
+  charts[s.k] = new Chart($('c-' + s.k), {
+    type: 'line',
+    data: { datasets: [
+      { label: 'U+', data: [], borderWidth: 0, pointRadius: 0, fill: false },
+      { label: '± U (k=2)', data: [], borderWidth: 0, pointRadius: 0, fill: '-1', backgroundColor: 'rgba(100,140,220,0.25)' },
+      { label: 'medida', data: [], borderColor: '#1f4e9c', backgroundColor: '#1f4e9c', borderWidth: 1.5, pointRadius: 1.5, fill: false },
+    ] },
+    options: {
+      animation: false, responsive: true, maintainAspectRatio: false, parsing: false,
+      scales: { x: { type: 'time', time: { tooltipFormat: 'dd/MM HH:mm:ss' } } },
+      plugins: {
+        title: { display: true, text: s.t },
+        legend: { labels: { filter: i => i.datasetIndex !== 0 } },
+        tooltip: { filter: i => i.datasetIndex === 2,
+                   callbacks: { label: c => c.raw.y.toFixed(3) + ' ± ' + (c.chart.u[c.dataIndex] ?? 0).toFixed(3) } },
+      },
+    },
+  });
+  charts[s.k].u = [];
+});
+
+function rango() {
+  const d = new Date($('ini').value + 'T00:00:00');          // hora local
+  const h = new Date($('fin').value + 'T00:00:00');
+  h.setDate(h.getDate() + 1);
+  return { desde: d.toISOString(), hasta: h.toISOString() };
+}
+
+async function cargar(s) {
+  const r = rango();
+  const url = `${API}datos.php?sensor=${s.k}&desde=${encodeURIComponent(r.desde)}&hasta=${encodeURIComponent(r.hasta)}`;
+  const d = await (await fetch(url)).json();
+  if (d.error) throw new Error(d.error);
+  const ch = charts[s.k];
+  ch.u = d.u;
+  ch.data.datasets[0].data = d.t.map((t, i) => ({ x: t, y: d.y[i] + d.u[i] }));
+  ch.data.datasets[1].data = d.t.map((t, i) => ({ x: t, y: d.y[i] - d.u[i] }));
+  ch.data.datasets[2].data = d.t.map((t, i) => ({ x: t, y: d.y[i] }));
+  ch.options.plugins.title.text = s.t + (d.paso > 1 ? ` (1 de cada ${d.paso})` : '') + (d.n === 0 ? ' — sin datos en el rango' : '');
+  ch.update();
+}
+
+async function estado() {
+  const d = await (await fetch(API + 'config_estado.php')).json();
+  const u = d.ultima;
+  $('ult').textContent = u ? `Última confirmación del Nivel 2: ${fmt(u.ack_nube)} (${u.sensor} → ${u.intervalo_ms} ms)`
+                           : 'Última confirmación del Nivel 2: aún ninguna';
+  const t = $('tabla');
+  t.innerHTML = '';
+  const cab = ['cmd', 'sensor', 'ms', 'estado', 'creado', 'entregado a N2', 'ack N2', 'ack en nube', 'motivo'];
+  const fila = (vals, tag) => { const tr = document.createElement('tr');
+    vals.forEach(v => { const c = document.createElement(tag); c.textContent = v; tr.appendChild(c); }); t.appendChild(tr); };
+  fila(cab, 'th');
+  d.comandos.forEach(c => fila([c.cmd_id, c.sensor, c.intervalo_ms, c.estado, fmt(c.creado), fmt(c.entregado),
+                                fmt(c.ack_n2), fmt(c.ack_nube), c.motivo || ''], 'td'));
+}
+
+async function todo() {
+  try {
+    await Promise.all(SENS.map(cargar));
+    await estado();
+  } catch (e) { $('msg').textContent = 'Error al consultar: ' + e.message; }
+}
+
+async function aplicar() {
+  const cambios = [], errores = [];
+  SENS.forEach(s => {
+    const v = $('iv-' + s.k).value;
+    if (v === '') return;
+    const n = Number(v);
+    if (!Number.isInteger(n) || n < s.min || n > 65535) errores.push(`${s.k}: entero entre ${s.min} y 65535 ms`);
+    else cambios.push({ sensor: s.k, intervalo_ms: n });
+  });
+  if (errores.length) { $('msg').textContent = 'Error: ' + errores.join('; '); return; }
+  if (!cambios.length) { $('msg').textContent = 'Ingrese al menos un intervalo.'; return; }
+  try {
+    const r = await fetch(API + 'config_solicitar.php', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ clave: $('clave').value, cambios }) });
+    const d = await r.json();
+    $('msg').textContent = r.ok ? 'Solicitud enviada: ' + cambios.map(c => `${c.sensor}=${c.intervalo_ms} ms`).join(', ') + ' (pendiente de confirmación)'
+                                : 'Error: ' + (d.error || r.status);
+    if (r.ok) SENS.forEach(s => $('iv-' + s.k).value = '');
+    estado();
+  } catch (e) { $('msg').textContent = 'Error de red: ' + e.message; }
+}
+
+const hoy = new Date(), ayer = new Date(); ayer.setDate(ayer.getDate() - 1);
+$('ini').value = dStr(ayer);
+$('fin').value = dStr(hoy);
+$('btnConsultar').onclick = todo;
+$('btnAplicar').onclick = aplicar;
+todo();
+setInterval(todo, 10000);
+</script>
+</body>
+</html>
