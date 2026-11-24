@@ -1,0 +1,235 @@
+#include <Wire.h>
+#include <ESP8266WiFi.h>
+#include <PubSubClient.h>
+
+// ---- configuracion ----
+const char*    WIFI_SSID = "WIFI_SSID";
+const char*    WIFI_PASS = "WIFI_PASS";
+const char*    MQTT_HOST = "172.20.10.10";   // IP de la PC local
+const uint16_t MQTT_PORT = 1883;
+const char*    NODO      = "nodo1";
+
+const uint8_t  MEGA_ADDR = 0x08;
+#define N_SENS 4
+const uint8_t  N_BYTES   = 24;               // 12 x uint16
+const unsigned long POLL_MS       = 250;     // periodo de consulta I2C
+const unsigned long VERIF_TOUT_MS = 3000;    // espera de confirmacion del Mega
+
+const char*    NOMBRE[N_SENS] = {"ldr", "dist", "temp", "rpm"};
+const uint16_t MIN_MS[N_SENS] = {50, 60, 750, 500};   // igual que el Mega
+const int16_t  INVALIDA = -32768;
+
+WiFiClient   wifi;
+PubSubClient mqtt(wifi);
+char T_SET[40], T_ACK[40], T_EST[40];
+
+// comando de configuracion en curso 
+struct Cmd {
+  bool activo;
+  bool verificando;
+  char id[24];
+  int  idx;
+  long ms;
+  unsigned long t;
+} cmd;
+
+char ultimoId[24]   = "";   // ultimo comando resuelto, para responder reenvios sin reaplicar
+char ultimoAck[200] = "";
+
+uint16_t ultimaSeq[N_SENS] = {0, 0, 0, 0};
+uint32_t i2cErr = 0;
+unsigned long tPoll = 0;
+
+// ---------- ACK ----------
+void publicarAck(const char* id, int idx, long ms, bool ok, const char* motivo) {
+  snprintf(ultimoAck, sizeof(ultimoAck),
+           "{\"cmd_id\":\"%s\",\"sensor\":\"%s\",\"intervalo_ms\":%ld,\"aplicado\":%s,"
+           "\"motivo\":\"%s\",\"t_ms\":%lu}",
+           id, (idx >= 0 && idx < N_SENS) ? NOMBRE[idx] : "?", ms,
+           ok ? "true" : "false", motivo, millis());
+  strncpy(ultimoId, id, sizeof(ultimoId) - 1);
+  ultimoId[sizeof(ultimoId) - 1] = 0;
+  mqtt.publish(T_ACK, ultimoAck);
+  Serial.printf("ACK: %s\n", ultimoAck);
+}
+
+// ---------- comandos ----------
+void solicitarCambio(const char* id, int idx, long ms) {
+  if (strcmp(id, ultimoId) == 0) {            // reenvio de un comando ya resuelto
+    mqtt.publish(T_ACK, ultimoAck);
+    return;
+  }
+  if (cmd.activo) return;                     // en curso (mismo id) u ocupado: la PC reintenta
+  if (idx < 0 || idx >= N_SENS || ms < MIN_MS[idx] || ms > 65535) {
+    publicarAck(id, idx, ms, false, "fuera_de_rango");
+    return;
+  }
+  strncpy(cmd.id, id, sizeof(cmd.id) - 1);
+  cmd.id[sizeof(cmd.id) - 1] = 0;
+  cmd.idx = idx;
+  cmd.ms = ms;
+  cmd.activo = true;
+  cmd.verificando = false;
+}
+
+void alMensaje(char* topic, byte* payload, unsigned int len) {
+  char buf[64];
+  if (len == 0 || len >= sizeof(buf)) return;
+  memcpy(buf, payload, len);
+  buf[len] = 0;
+  char id[24];
+  int idx;
+  long ms;
+  if (sscanf(buf, "%23[^,],%d,%ld", id, &idx, &ms) != 3) {
+    Serial.printf("Comando invalido: %s\n", buf);
+    return;
+  }
+  Serial.printf("Comando: id=%s sensor=%d ms=%ld\n", id, idx, ms);
+  solicitarCambio(id, idx, ms);
+}
+
+// escribe el comando en el Mega por I2C (se ejecuta desde loop, no desde el callback)
+void aplicarComando() {
+  uint8_t err = 0xFF;
+  for (uint8_t k = 0; k < 3 && err != 0; k++) {
+    Wire.beginTransmission(MEGA_ADDR);
+    Wire.write((uint8_t)0x01);
+    Wire.write((uint8_t)cmd.idx);
+    Wire.write((uint8_t)(cmd.ms & 0xFF));
+    Wire.write((uint8_t)((cmd.ms >> 8) & 0xFF));
+    err = Wire.endTransmission();
+    if (err) { i2cErr++; delay(5); }
+  }
+  if (err) {
+    publicarAck(cmd.id, cmd.idx, cmd.ms, false, "i2c_error");
+    cmd.activo = false;
+    return;
+  }
+  cmd.verificando = true;
+  cmd.t = millis();
+  tPoll = millis() - POLL_MS + 50;            // fuerza una lectura en ~50 ms para verificar
+}
+
+// ---------- telemetria ----------
+void publicarMuestra(uint8_t i, const uint16_t* d) {
+  char val[16];
+  bool ok = true;
+  switch (i) {
+    case 0: snprintf(val, sizeof(val), "%u", d[0]); break;
+    case 1: ok = d[1] > 0; snprintf(val, sizeof(val), "%u", d[1]); break;
+    case 2: {
+      int16_t t = (int16_t)d[2];
+      ok = (t != INVALIDA);
+      snprintf(val, sizeof(val), "%.2f", t / 100.0f);
+      break;
+    }
+    default: snprintf(val, sizeof(val), "%u", d[3]); break;
+  }
+  if (!ok) strcpy(val, "null");
+
+  char json[160], topic[56];
+  snprintf(json, sizeof(json),
+           "{\"valor\":%s,\"ok\":%d,\"intervalo_ms\":%u,\"seq\":%u,\"t_ms\":%lu}",
+           val, ok ? 1 : 0, d[4 + i], d[8 + i], millis());
+  snprintf(topic, sizeof(topic), "imec/%s/telemetria/%s", NODO, NOMBRE[i]);
+  if (mqtt.publish(topic, json)) ultimaSeq[i] = d[8 + i];
+}
+
+void leerMega() {
+  if (Wire.requestFrom(MEGA_ADDR, N_BYTES) != N_BYTES) {
+    i2cErr++;
+    while (Wire.available()) Wire.read();
+    Serial.printf("Sin respuesta del Mega (err I2C acumulados=%lu)\n", (unsigned long)i2cErr);
+    return;
+  }
+  uint16_t d[12];
+  uint8_t* p = (uint8_t*)d;
+  for (uint8_t i = 0; i < N_BYTES; i++) p[i] = Wire.read();
+
+  // confirmacion fisica: el Mega informa el intervalo que tiene aplicado
+  if (cmd.activo && cmd.verificando) {
+    if ((long)d[4 + cmd.idx] == cmd.ms) {
+      publicarAck(cmd.id, cmd.idx, cmd.ms, true, "ok");
+      cmd.activo = false;
+    } else if (millis() - cmd.t > VERIF_TOUT_MS) {
+      publicarAck(cmd.id, cmd.idx, cmd.ms, false, "no_confirmado");
+      cmd.activo = false;
+    }
+  }
+
+  // publica cada muestra una sola vez (seq 0 = el sensor aun no midio)
+  if (mqtt.connected()) {
+    for (uint8_t i = 0; i < N_SENS; i++) {
+      if (d[8 + i] != ultimaSeq[i]) publicarMuestra(i, d);
+    }
+  }
+
+  static unsigned long tPrint = 0;
+  if (millis() - tPrint >= 2000) {
+    tPrint = millis();
+    Serial.printf("LDR=%u | dist=%u mm | T=%d (x100) | RPM=%u | int=%u/%u/%u/%u ms | I2C err=%lu\n",
+                  d[0], d[1], (int16_t)d[2], d[3], d[4], d[5], d[6], d[7], (unsigned long)i2cErr);
+  }
+}
+
+// ---------- conexiones (sin bloquear el I2C mas de lo necesario) ----------
+void mantenerMqtt() {
+  static unsigned long tReintento = 0;
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (mqtt.connected()) return;
+  if (millis() - tReintento < 5000) return;
+  tReintento = millis();
+
+  char cid[32];
+  snprintf(cid, sizeof(cid), "esp-%s-%06X", NODO, (unsigned)ESP.getChipId());
+  Serial.print("MQTT... ");
+  if (mqtt.connect(cid, T_EST, 1, true, "offline")) {
+    Serial.println("conectado");
+    mqtt.subscribe(T_SET, 1);
+    mqtt.publish(T_EST, "online", true);
+  } else {
+    Serial.printf("fallo rc=%d\n", mqtt.state());
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.setTimeout(50);
+  Wire.begin(4, 5);                 // SDA = GPIO4 (D2), SCL = GPIO5 (D1)
+  Wire.setClock(100000);
+  Wire.setClockStretchLimit(5000);  // el AVR estira SCL durante sus ISR
+
+  snprintf(T_SET, sizeof(T_SET), "imec/%s/config/set", NODO);
+  snprintf(T_ACK, sizeof(T_ACK), "imec/%s/config/ack", NODO);
+  snprintf(T_EST, sizeof(T_EST), "imec/%s/estado", NODO);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setCallback(alMensaje);
+  mqtt.setBufferSize(384);
+  mqtt.setKeepAlive(30);
+
+  Serial.println("Gateway listo. Comando local: s <sensor 0..3> <ms>");
+}
+
+void loop() {
+  mantenerMqtt();
+  mqtt.loop();
+
+  if (cmd.activo && !cmd.verificando) aplicarComando();
+
+  if (millis() - tPoll >= POLL_MS) {
+    tPoll = millis();
+    leerMega();
+  }
+
+  // prueba local por monitor serie: s <sensor> <ms>
+  if (Serial.available() && Serial.read() == 's') {
+    int s = Serial.parseInt();
+    long ms = Serial.parseInt();
+    char id[24];
+    snprintf(id, sizeof(id), "serial-%lu", millis());
+    solicitarCambio(id, s, ms);
+  }
+}
